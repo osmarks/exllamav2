@@ -24,7 +24,8 @@ typedef void (*fp_layer_norm_kernel)
     const float,
     const float,
     const int,
-    const int
+    const int,
+    const bool
 );
 
 template <int blocks_per_warp>
@@ -37,7 +38,8 @@ __global__ void layer_norm_kernel
     const float epsilon,
     const float r_dim,
     const int rows,
-    const int dim
+    const int dim,
+    const bool add_residual
 )
 {
     int warp_id = threadIdx.x / WARP_SIZE;
@@ -81,7 +83,11 @@ __global__ void layer_norm_kernel
 
     // Load partial sums from across warps, shuffle again across lanes
 
-    sum = sums[lane_id];
+    #if defined(USE_ROCM)
+        sum = lane_id < NUM_WARPS ? sums[lane_id] : 0.0f;
+    #else
+        sum = sums[lane_id];
+    #endif
     for(int offset = warpSize / 2; offset > 0; offset /= 2) sum += __shfl_xor_sync(0xffffffff, sum, offset);
 
     // Compute mean
@@ -116,7 +122,11 @@ __global__ void layer_norm_kernel
 
     // Load partial sums from across warps, shuffle again across lanes
 
-    sum = sums[lane_id];
+    #if defined(USE_ROCM)
+        sum = lane_id < NUM_WARPS ? sums[lane_id] : 0.0f;
+    #else
+        sum = sums[lane_id];
+    #endif
     for(int offset = warpSize / 2; offset > 0; offset /= 2) sum += __shfl_xor_sync(0xffffffff, sum, offset);
 
     // Get 1/sqrt(variance)
@@ -141,7 +151,10 @@ __global__ void layer_norm_kernel
         half2 nh = __halves2half2(__float2half_rn(n0), __float2half_rn(n1));
         if (b) nh = __hadd2(nh, b2[column]);  // Optional bias
 
-        y_row[column] = nh;
+        if (add_residual)
+            y_row[column] = __hadd2(nh, y_row[column]);
+        else
+            y_row[column] = nh;
     }
 }
 
@@ -171,13 +184,17 @@ fp_layer_norm_kernel pick_layer_norm_kernel(const int blocks_per_warp)
 
 void layer_norm_cuda
 (
+    cudaStream_t stream,
     const half* x,
     const half* w,
     const half* b,
     half* y,
     const float epsilon,
     const int rows,
-    const int dim
+    const int dim,
+    const bool add_residual,
+    Graph* graph,
+    int label
 )
 {
     dim3 blockDim, gridDim;
@@ -190,5 +207,27 @@ void layer_norm_cuda
 
     int blocks_per_warp = DIVIDE(dim, NUM_THREADS * 2);
     fp_layer_norm_kernel kernel = pick_layer_norm_kernel(blocks_per_warp);
-    kernel<<<gridDim, blockDim>>>(x, w, b, y, epsilon, r_dim, rows, dim);
+    kernel<<<gridDim, blockDim, 0, stream>>>(x, w, b, y, epsilon, r_dim, rows, dim, add_residual);
+    if (graph) graph->attach_label(stream, label, 0);
 }
+
+void layer_norm_cuda_update_x
+(
+    Graph* graph,
+    int label,
+    void* x
+)
+{
+    graph->update_param_ptr(label, 0, 0, x);
+}
+
+void layer_norm_cuda_update_y
+(
+    Graph* graph,
+    int label,
+    void* y
+)
+{
+    graph->update_param_ptr(label, 0, 3, y);
+}
+

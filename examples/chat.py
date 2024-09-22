@@ -8,6 +8,9 @@ from exllamav2 import(
     ExLlamaV2Cache,
     ExLlamaV2Cache_8bit,
     ExLlamaV2Cache_Q4,
+    ExLlamaV2Cache_Q6,
+    ExLlamaV2Cache_Q8,
+    ExLlamaV2Cache_TP,
     ExLlamaV2Tokenizer,
     model_init,
 )
@@ -54,10 +57,12 @@ parser.add_argument("-ncf", "--no_code_formatting", action = "store_true", help 
 
 parser.add_argument("-c8", "--cache_8bit", action = "store_true", help = "Use 8-bit (FP8) cache")
 parser.add_argument("-cq4", "--cache_q4", action = "store_true", help = "Use Q4 cache")
+parser.add_argument("-cq6", "--cache_q6", action = "store_true", help = "Use Q6 cache")
+parser.add_argument("-cq8", "--cache_q8", action = "store_true", help = "Use Q8 cache")
 
 parser.add_argument("-ngram", "--ngram_decoding", action = "store_true", help = "Use n-gram speculative decoding")
 
-parser.add_argument("-pt", "--print_timings", action = "store_true", help = "Output timings after each prompt")
+parser.add_argument("-pt", "--print_timings", action = "store_true", help = "Output timings/stats after each prompt")
 parser.add_argument("-amnesia", "--amnesia", action = "store_true", help = "Forget context after every response")
 
 # Arrrgs
@@ -90,7 +95,7 @@ if system_prompt is None: system_prompt = prompt_format.default_system_prompt()
 
 model_init.check_args(args)
 model_init.print_options(args)
-model, tokenizer = model_init.init(args, allow_auto_split = True, max_output_len = 16)
+model, tokenizer = model_init.init(args, allow_auto_split = True, max_output_len = 16, skip_load = True)
 
 # Initialize draft model if provided, assume it always fits on first device
 
@@ -128,23 +133,41 @@ if args.draft_model_dir:
         draft_cache = ExLlamaV2Cache_8bit(draft_model)
     elif args.cache_q4:
         draft_cache = ExLlamaV2Cache_Q4(draft_model)
+    elif args.cache_q6:
+        draft_cache = ExLlamaV2Cache_Q6(draft_model)
+    elif args.cache_q8:
+        draft_cache = ExLlamaV2Cache_Q8(draft_model)
     else:
         draft_cache = ExLlamaV2Cache(draft_model)
+
+# Load model after draft model
+
+print(" -- Loading model...")
+
+model_init.post_init_load(model, args, allow_auto_split = True)
 
 # Create cache
 
 if args.cache_8bit:
-    cache = ExLlamaV2Cache_8bit(model, lazy = not model.loaded)
+    cache_type = ExLlamaV2Cache_8bit
 elif args.cache_q4:
-    cache = ExLlamaV2Cache_Q4(model, lazy = not model.loaded)
+    cache_type = ExLlamaV2Cache_Q4
+elif args.cache_q6:
+    cache_type = ExLlamaV2Cache_Q6
+elif args.cache_q8:
+    cache_type = ExLlamaV2Cache_Q8
 else:
-    cache = ExLlamaV2Cache(model, lazy = not model.loaded)
+    cache_type = ExLlamaV2Cache
+
+if model.tp_context:
+    cache = ExLlamaV2Cache_TP(model, base = cache_type)
+else:
+    cache = cache_type(model, lazy = not model.loaded)
 
 # Load model now if auto split enabled
 
 if not model.loaded:
 
-    print(" -- Loading model...")
     model.load_autosplit(cache)
 
 # Chat context
@@ -199,17 +222,18 @@ def get_tokenized_context(max_len):
 generator = ExLlamaV2StreamingGenerator(model, cache, tokenizer, draft_model, draft_cache)
 generator.speculative_ngram = args.ngram_decoding
 
-settings = ExLlamaV2Sampler.Settings()
-settings.temperature = args.temperature
-settings.top_k = args.top_k
-settings.top_p = args.top_p
-settings.top_a = args.top_a
-settings.typical = args.typical
-settings.skew = args.skew
-settings.token_repetition_penalty = args.repetition_penalty
-settings.token_frequency_penalty = args.frequency_penalty
-settings.token_presence_penalty = args.presence_penalty
-settings.smoothing_factor = args.smoothing_factor
+settings = ExLlamaV2Sampler.Settings(
+    temperature = args.temperature,
+    top_k = args.top_k,
+    top_p = args.top_p,
+    top_a = args.top_a,
+    typical = args.typical,
+    skew = args.skew,
+    token_repetition_penalty = args.repetition_penalty,
+    token_frequency_penalty = args.frequency_penalty,
+    token_presence_penalty = args.presence_penalty,
+    smoothing_factor = args.smoothing_factor,
+)
 
 if args.dynamic_temperature:
     dt_args = [float(alloc) for alloc in args.dynamic_temperature.split(",")]
@@ -222,7 +246,9 @@ min_space_in_context = args.response_chunk
 
 # Stop conditions
 
-generator.set_stop_conditions(prompt_format.stop_conditions(tokenizer))
+sc = prompt_format.stop_conditions(tokenizer)
+sc = [x for x in sc if x]
+generator.set_stop_conditions(sc)
 
 # ANSI color codes
 
@@ -380,8 +406,9 @@ while True:
         else:
             sd_stats = ""
 
+        ctx_tokens = active_context.shape[-1]
         print()
-        print(col_sysprompt + f"(Response: {response_tokens} tokens, {speed:.2f} tokens/second{sd_stats})" + col_default)
+        print(col_sysprompt + f"(Context: {ctx_tokens} tokens, response: {response_tokens} tokens, {speed:.2f} tokens/second{sd_stats})" + col_default)
 
     # Optionally forget context after each response
 

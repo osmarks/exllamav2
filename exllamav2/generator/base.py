@@ -9,11 +9,13 @@ from exllamav2 import (
 from exllamav2.generator import (
     ExLlamaV2Sampler
 )
+from exllamav2.generator.filters import ExLlamaV2Filter
 import torch
 import random
 import threading
 from exllamav2.generator.hooks import ExLlamaV2PostSamplingHook, ExLlamaV2PostSamplingResult
 from exllamav2.embedding import EMBEDDING_INDEX
+from exllamav2.util import cuda_sync_active
 from exllamav2.activation_editing import ExLlamaV2ActivationEditingHook
 
 class ExLlamaV2BaseGenerator:
@@ -46,7 +48,7 @@ class ExLlamaV2BaseGenerator:
 
         input_ids = torch.zeros((1, 2), dtype = torch.long)
         self.model.forward(input_ids, cache = None, input_mask = None, preprocess_only = True)
-        torch.cuda.synchronize()
+        cuda_sync_active()
 
 
     def full(self):
@@ -68,7 +70,10 @@ class ExLlamaV2BaseGenerator:
                         abort_event: threading.Event | None = None,
                         input_embeddings: torch.Tensor | None = None,
                         completion_only: bool = False,
-                        activation_edit_hooks: list[ExLlamaV2ActivationEditingHook] = []):
+                        filters: list[ExLlamaV2Filter] | None = None,
+                        filter_prefer_eos: bool = False,
+                        activation_edit_hooks: list[ExLlamaV2ActivationEditingHook] = []
+    ):
 
         """
         Generate one or more completions.
@@ -120,6 +125,12 @@ class ExLlamaV2BaseGenerator:
         :param completion_only:
             Only return completion. If False, returned string will include the input prompt.
 
+        :param filters:
+            List of ExLlamaV2Filters to apply during generation.
+
+        :param filter_prefer_eos:
+            If True, always sample the tokenizer's defined EOS token as soon as it's allowed by the filters
+
         :param activation_edit_hooks:
             List of ExLlamaV2ActivationEditingHook objects to apply during generation.
 
@@ -130,6 +141,10 @@ class ExLlamaV2BaseGenerator:
 
         self.abort_event = abort_event
         if self.abort_event: self.abort_event.clear()
+
+        # Filters
+
+        if filters is None: filters = []
 
         # Default stop token
 
@@ -235,7 +250,8 @@ class ExLlamaV2BaseGenerator:
             heal = [id_to_piece[x] for x in unhealed_token_list]
         else:
             heal = None
-        gen_settings.begin_filters(heal)
+
+        for f in filters: f.begin(heal)
 
         # Generate tokens
 
@@ -254,12 +270,17 @@ class ExLlamaV2BaseGenerator:
                                         indexed_embeddings = input_embeddings,
                                         activation_edit_hooks = activation_edit_hooks).float().cpu()
 
-            token, ptokens, pprobs, prob, eos = ExLlamaV2Sampler.sample(logits,
-                                                                        gen_settings,
-                                                                        self.sequence_ids,
-                                                                        random.random(),
-                                                                        self.tokenizer,
-                                                                        prefix_token = unhealed_token)
+            token, ptokens, pprobs, prob, eos = \
+            ExLlamaV2Sampler.sample(
+                logits,
+                gen_settings,
+                self.sequence_ids,
+                random.random(),
+                self.tokenizer,
+                prefix_token = unhealed_token,
+                filters = filters,
+                filter_prefer_eos = filter_prefer_eos
+            )
 
             if unhealed_token is not None:
                 unhealed_token_copy = unhealed_token
@@ -287,10 +308,9 @@ class ExLlamaV2BaseGenerator:
                     h(p)
                 token = p.sampled_token
                 if p.feed_filters:
-                    gen_settings.feed_filters(token)
-
+                    for f in filters: f.feed(token)
             else:
-                gen_settings.feed_filters(token)
+                for f in filters: f.feed(token)
 
             self.sequence_ids = torch.cat([self.sequence_ids, token], dim = 1)
 

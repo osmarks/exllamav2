@@ -11,8 +11,8 @@
 
 const int top_k_heap_threshold = 500;
 
-bool* g_rep_mask = NULL;
-int g_vocab_size = 0;
+//bool* g_rep_mask = NULL;
+//int g_vocab_size = 0;
 
 // Repetition penalty
 
@@ -34,14 +34,14 @@ void apply_rep_penalty_cpu
 
     // Map of which logits have already had penalties applied
 
-    if (vocab_size > g_vocab_size)
-    {
-        if (g_rep_mask) free(g_rep_mask);
-        g_vocab_size = vocab_size;
-        g_rep_mask = (bool*) malloc(g_vocab_size * sizeof(bool));
-    }
-
-    memset(g_rep_mask, 0, g_vocab_size * sizeof(bool));
+//    if (vocab_size > g_vocab_size)
+//    {
+//        if (g_rep_mask) free(g_rep_mask);
+//        g_vocab_size = vocab_size;
+//        g_rep_mask = (bool*) malloc(g_vocab_size * sizeof(bool));
+//    }
+//    memset(g_rep_mask, 0, g_vocab_size * sizeof(bool));
+    bool* g_rep_mask = (bool*) calloc(vocab_size, sizeof(bool));
 
     // Penalties to apply
 
@@ -75,22 +75,25 @@ void apply_rep_penalty_cpu
     for (int i = seq_len; i > beg;)
     {
         uint64_t t = sequence[--i];
-
-        // If t has not been encountered before, apply rep_p and pres_p
-
-        if (!g_rep_mask[t])
+        if (t < vocab_size)
         {
-            if (logits[t] > 0.0) logits[t] /= rep_p;  // Multiplicative penalty
-            else logits[t] *= rep_p;
 
-            logits[t] -= pres_p;  // Additive penalty
+            // If t has not been encountered before, apply rep_p and pres_p
 
-            g_rep_mask[t] = true;  // Only once per logit
+            if (!g_rep_mask[t])
+            {
+                if (logits[t] > 0.0) logits[t] /= rep_p;  // Multiplicative penalty
+                else logits[t] *= rep_p;
+
+                logits[t] -= pres_p;  // Additive penalty
+
+                g_rep_mask[t] = true;  // Only once per logit
+            }
+
+            // Apply freq_p penalty for every time a token is encountered, so the total additive penalty is count * freq_p
+
+            logits[t] -= freq_p;
         }
-
-        // Apply freq_p penalty for every time a token is encountered, so the total additive penalty is count * freq_p
-
-        logits[t] -= freq_p;
 
         // If we're in the "decay" range, reduce penalties for every token
 
@@ -102,11 +105,12 @@ void apply_rep_penalty_cpu
         }
     }
 
+    free(g_rep_mask);
     profile_stop();
 }
 
 AVX2_TARGET_OPTIONAL
-void softmax_cpu_nonavx2
+int softmax_cpu_nonavx2
 (
     const int vocab_size,
     const float temperature,
@@ -121,16 +125,21 @@ void softmax_cpu_nonavx2
     float esum = 0.0f;
     float itemp = 1.0f / temperature;
     float maxl = -1e38;
+    int maxi;
 
     for (int i = 0; i < vocab_size; i++)
     {
-        if (!logits_filter[i]) continue;
-        maxl = fmaxf(logits[i], maxl);
+        if (logits_filter && !logits_filter[i]) continue;
+        if (logits[i] > maxl)
+        {
+            maxl = logits[i];
+            maxi = i;
+        }
     }
 
     for (int i = 0; i < vocab_size; i++)
     {
-        if (!logits_filter[i]) continue;
+        if (logits_filter && !logits_filter[i]) continue;
         float l = logits[i] - maxl;
         if (exponent == 2.0f)
             l *= -l;
@@ -145,11 +154,12 @@ void softmax_cpu_nonavx2
 
     for (int i = 0; i < vocab_size; i++)
     {
-        if (logits_filter[i]) output[i] *= isum;
+        if (!logits_filter || logits_filter[i]) output[i] *= isum;
         else output[i] = 0.0f;
     }
 
     profile_stop();
+    return maxi;
 
 //    printf("Softmax:");
 //    float summ = 0.0f;
@@ -165,7 +175,7 @@ void softmax_cpu_nonavx2
 //    printf("sum: %f\n\n", summ);
 }
 
-void softmax_cpu
+int softmax_cpu
 (
     const int vocab_size,
     const float temperature,
@@ -435,7 +445,8 @@ int top_k_cpu
     const int num_candidates,
     float* temp_probs,
     int* temp_indices,
-    int top_k
+    int top_k,
+    int maxlogit
 )
 {
     profile_start("top_k_cpu");
@@ -444,20 +455,28 @@ int top_k_cpu
 
     if (top_k == 1)
     {
-        int maxidx = -1;
-        float max = -1e38;
-
-        for(int i = 0; i < num_candidates; i++)
+        if (maxlogit >= 0)
         {
-            if (maxidx == -1 || temp_probs[i] > max)
-            {
-                max = temp_probs[i];
-                maxidx = i;
-            }
+            swap<float>(temp_probs[0], temp_probs[maxlogit]);
+            swap<int>(temp_indices[0], temp_indices[maxlogit]);
         }
+        else
+        {
+            int maxidx = -1;
+            float max = -1e38;
 
-        swap<float>(temp_probs[0], temp_probs[maxidx]);
-        swap<int>(temp_indices[0], temp_indices[maxidx]);
+            for(int i = 0; i < num_candidates; i++)
+            {
+                if (maxidx == -1 || temp_probs[i] > max)
+                {
+                    max = temp_probs[i];
+                    maxidx = i;
+                }
+            }
+
+            swap<float>(temp_probs[0], temp_probs[maxidx]);
+            swap<int>(temp_indices[0], temp_indices[maxidx]);
+        }
     }
 
     // Use min-heap for lower values of K
@@ -814,7 +833,12 @@ int multinomial_cpu
     while (true)
     {
         if (accum >= random) break;
-        if (idx == num_candidates - 1) break;
+        if (idx == num_candidates - 1)
+        {
+            // Roll back in case the sampled probability is exactly zero
+            while (idx > 0 && temp_probs[idx] == 0.0f) idx--;
+            break;
+        }
         idx++;
         accum += temp_probs[idx];
     }

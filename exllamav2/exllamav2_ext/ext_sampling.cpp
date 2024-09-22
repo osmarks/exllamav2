@@ -18,9 +18,11 @@
 #include "config.h"
 #include "ext_sampling.h"
 
+#include "cpp/generator.h"
 #include "cpp/sampling.h"
 
 #include "cpp/util.h"
+#include "Python.h"
 
 void apply_rep_penalty
 (
@@ -41,6 +43,8 @@ void apply_rep_penalty
     int bsz = sequence.size(0);
     int seq_len = sequence.size(-1);
 
+    Py_BEGIN_ALLOW_THREADS
+
     for (int i = 0; i < bsz; i++)
     {
         apply_rep_penalty_cpu
@@ -56,11 +60,13 @@ void apply_rep_penalty
             ((float*) logits.data_ptr()) + i * vocab_size
         );
     }
+
+    Py_END_ALLOW_THREADS
 }
 
 std::vector<float> sample_basic
 (
-    torch::Tensor logits,           // shape [bsz, vocab_size]
+    torch::Tensor logits,           // shape [bsz, 1, vocab_size]
     float temperature,
     int top_k,
     float top_p,
@@ -90,10 +96,10 @@ std::vector<float> sample_basic
     TORCH_CHECK_DTYPE(output_tokens, kLong);
     TORCH_CHECK_DTYPE(output_probs, kFloat);
     TORCH_CHECK_DTYPE(logits, kFloat);
-    TORCH_CHECK_DTYPE(logit_filter, kBool);
+    TORCH_CHECK_DTYPE_OPT(logit_filter, kBool);
 
-    TORCH_CHECK_SHAPES(logit_filter, 0, logits, 0, 1);
-    TORCH_CHECK_SHAPES(logit_filter, 1, logits, 1, 1);
+    TORCH_CHECK_SHAPES_OPT(logit_filter, 0, logits, 0, 1);
+    TORCH_CHECK_SHAPES_OPT(logit_filter, 1, logits, -1, 1);
 
     int vocab_size = logits.size(-1);
     int bsz = logits.size(0);
@@ -106,7 +112,9 @@ std::vector<float> sample_basic
     if (!output_kprobs.device().is_meta())
         num_probs = output_kprobs.size(2);
 
-    bool* logits_filter_ptr = (bool*) logit_filter.data_ptr();
+    bool* logits_filter_ptr = logit_filter.device().is_meta() ? NULL : (bool*) logit_filter.data_ptr();
+
+    Py_BEGIN_ALLOW_THREADS
 
     if (temperature < 0.01)
     {
@@ -123,12 +131,12 @@ std::vector<float> sample_basic
             temperature /= smoothing_factor;
         }
 
-        softmax_cpu
+        int maxlogit = softmax_cpu
         (
              vocab_size,
              temperature,
              logits_ptr + i * vocab_size,
-             logits_filter_ptr + i * vocab_size,
+             logits_filter_ptr ? logits_filter_ptr + i * vocab_size : NULL,
              exponent,
              temp_probs
         );
@@ -138,7 +146,7 @@ std::vector<float> sample_basic
 
         if (top_k > 0 && top_k < vocab_size)
         {
-            num_candidates = top_k_cpu(num_candidates, temp_probs, temp_indices, top_k);
+            num_candidates = top_k_cpu(num_candidates, temp_probs, temp_indices, top_k, maxlogit);
             normalize_cpu(num_candidates, temp_probs);
         }
 
@@ -222,7 +230,24 @@ std::vector<float> sample_basic
             random_s = powf(random, expf(-skew));
         }
 
-        multinomial_cpu(num_candidates, temp_probs, temp_indices, random_s);
+//        {
+//            float sum = 0.0f;
+//            float pmin = temp_probs[0];
+//            float pmax = pmin;
+//            for (int i = 0; i < num_candidates; ++i)
+//            {
+//                if (temp_probs[i] < pmin) pmin = temp_probs[i];
+//                if (temp_probs[i] > pmax) pmax = temp_probs[i];
+//                sum += temp_probs[i];
+//            }
+//            DBGF4(pmin, pmax, sum, random_s);
+//        }
+
+        // Scale random sampling point a little to account for FP32 rounding errors during softmax. Probs
+        // can potentially sum to slightly less than 1 for large-vocab models
+        float random_s_adj = random_s * 0.9998;
+
+        multinomial_cpu(num_candidates, temp_probs, temp_indices, random_s_adj);
 
         output_tokens[i][0] = temp_indices[0];
         output_probs[i][0] = temp_probs[0];
@@ -250,13 +275,14 @@ std::vector<float> sample_basic
     _mm_free(temp_probs);
     _mm_free(temp_indices);
 
+    Py_END_ALLOW_THREADS
     return mirostat_mu;
 }
 
 void logit_filter_exclusive
 (
     torch::Tensor filter,                                       // shape [bsz, vocab_size]
-    const std::vector<std::vector<int>> &exclusive_lists
+    const py::list& exclusive_lists
 )
 {
     TORCH_CHECK_DTYPE(filter, kBool);
@@ -265,11 +291,15 @@ void logit_filter_exclusive
     bool* filter_ptr = (bool*) filter.data_ptr();
     unsigned int vocab_size = filter.size(1);
 
-    for(const auto& list : exclusive_lists)
+//    Py_BEGIN_ALLOW_THREADS
+
+    for(const auto& list_ : exclusive_lists)
     {
+        auto list = list_.cast<py::list>();
+
         unsigned int id = 0;
         unsigned int next_id_idx = 0;
-        unsigned int next_id = list[next_id_idx];
+        unsigned int next_id = list[next_id_idx].cast<unsigned int>();
 
         while (id < vocab_size)
         {
@@ -281,11 +311,13 @@ void logit_filter_exclusive
             id++;
             next_id_idx++;
             if (next_id_idx >= list.size()) next_id = vocab_size;
-            else next_id = list[next_id_idx];
+            else next_id = list[next_id_idx].cast<unsigned int>();;
         }
 
         filter_ptr += vocab_size;
     }
+
+//    Py_END_ALLOW_THREADS
 }
 
 void fast_fill_cpu_ones_bool(torch::Tensor tensor)
@@ -306,21 +338,72 @@ void fast_fadd_cpu(torch::Tensor a, torch::Tensor b)
     float* a_ptr = (float*) a.data_ptr();
     float* b_ptr = (float*) b.data_ptr();
 
+    Py_BEGIN_ALLOW_THREADS
+
     for (int i = 0; i < bsz; ++i)
     {
         float* b_ptr_ = b_ptr;
         for (int j = 0; j < m; ++j)
             *a_ptr++ += *b_ptr_++;
     }
+
+    Py_END_ALLOW_THREADS
 }
 
-void fast_copy_cpu(torch::Tensor a, torch::Tensor b)
+void fast_copy_cpu(torch::Tensor dst, torch::Tensor src)
 {
-    size_t size_a = a.numel() * torch::elementSize(torch::typeMetaToScalarType(a.dtype()));
-    size_t size_b = b.numel() * torch::elementSize(torch::typeMetaToScalarType(b.dtype()));
-    TORCH_CHECK(size_a == size_b, "a and b are not the same size");
-    memcpy(a.data_ptr(), b.data_ptr(), size_a);
+    TORCH_CHECK(dst.sizes() == src.sizes(), "Tensors must have the same shape");
+    TORCH_CHECK(dst.dtype() == src.dtype(), "Tensors must have the same dtype");
+
+    auto dst_strides = dst.strides();
+    auto src_strides = src.strides();
+    auto sizes = dst.sizes();
+
+    Py_BEGIN_ALLOW_THREADS
+
+    if (dst.is_contiguous() && src.is_contiguous())
+    {
+        std::memcpy(dst.data_ptr(), src.data_ptr(), src.numel() * src.element_size());
+    }
+    else
+    {
+        auto copy_recursive = [&](auto& self, int64_t dst_offset, int64_t src_offset, int dim) -> void
+        {
+            if (dim == sizes.size())
+            {
+                std::memcpy(static_cast<char*>(dst.data_ptr()) + dst_offset * dst.element_size(),
+                            static_cast<char*>(src.data_ptr()) + src_offset * src.element_size(),
+                            dst.element_size());
+                return;
+            }
+
+            for (int64_t i = 0; i < sizes[dim]; ++i)
+            {
+                self(self, dst_offset + i * dst_strides[dim],
+                     src_offset + i * src_strides[dim],
+                     dim + 1);
+            }
+        };
+
+        copy_recursive(copy_recursive, 0, 0, 0);
+    }
+
+    Py_END_ALLOW_THREADS
 }
+
+
+//void fast_copy_cpu(torch::Tensor a, torch::Tensor b)
+//{
+//    size_t size_a = a.numel() * torch::elementSize(torch::typeMetaToScalarType(a.dtype()));
+//    size_t size_b = b.numel() * torch::elementSize(torch::typeMetaToScalarType(b.dtype()));
+//    TORCH_CHECK(size_a == size_b, "a and b are not the same size");
+//
+//    Py_BEGIN_ALLOW_THREADS
+//
+//    memcpy(a.data_ptr(), b.data_ptr(), size_a);
+//
+//    Py_END_ALLOW_THREADS
+//}
 
 void dump_profile_results()
 {

@@ -1,5 +1,8 @@
 from __future__ import annotations
 import os, sys
+
+from exllamav2.architecture import RopeStyle
+
 min_version = (3, 8)
 if sys.version_info < min_version:
     print("")
@@ -14,11 +17,20 @@ os.environ["CUDA_MODULE_LOADING"] = "LAZY"
 # if not "PYTORCH_CUDA_ALLOC_CONF" in os.environ:
 #     try:
 #         x = torch.__version__
-#         # TODO: Should maybe be a warning here?
 #     except NameError:
 #         os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "backend:cudaMallocAsync"
 
 import torch
+if not (torch.version.cuda or torch.version.hip):
+    print("")
+    print(f" ## Warning: The installed version of PyTorch is {torch.__version__} and does not support CUDA or ROCm.")
+    print("")
+
+# PyTorch, especially v2.3.1, gets confused when working with small CPU tensors and likes to use way too many worker
+# threads for small operations, adding considerable overhead. Limit it to a single thread to avoid that (globally
+# because that seems to be the only way)
+torch.set_num_threads(1)
+
 import math
 from exllamav2.config import ExLlamaV2Config
 from exllamav2.cache import ExLlamaV2CacheBase
@@ -26,146 +38,30 @@ from exllamav2.linear import ExLlamaV2Linear
 from exllamav2.module import ExLlamaV2Module
 from exllamav2.rmsnorm import ExLlamaV2RMSNorm
 from exllamav2.layernorm import ExLlamaV2LayerNorm
-from exllamav2.attn import ExLlamaV2Attention, has_flash_attn
+from exllamav2.attn import ExLlamaV2Attention, has_flash_attn, has_xformers
 from exllamav2.lora import ExLlamaV2Lora
 from exllamav2.mlp import ExLlamaV2MLP
 from exllamav2.moe_mlp import ExLlamaV2MoEMLP
 from exllamav2.parallel_decoder import ExLlamaV2ParallelDecoder
 from exllamav2.embedding import ExLlamaV2Embedding
+from exllamav2.pos_embedding import ExLlamaV2PosEmbedding
 from exllamav2.compat import safe_move_tensor
 from exllamav2.fasttensors import cleanup_stfiles
 from exllamav2.activation_editing import ExLlamaV2ActivationEditingHook
-# from exllamav2.util import list_live_tensors, print_vram_usage, set_snapshot, diff_snapshot, print_vram_usage_peak
+from exllamav2.device import ExLlamaV2DeviceContext, set_device_streams
+from exllamav2.tensor_p import TPContext, BROADCAST_VC
 import gc
 import threading
 from typing import Callable
+# from exllamav2.util import list_live_tensors, print_vram_usage, set_snapshot, diff_snapshot, print_vram_usage_peak
+from exllamav2.util import get_basic_progress
+# from line_profiler import profile
+from exllamav2.ext import exllamav2_ext as ext_c, none_tensor
+
 
 def _torch_device(idx):
     if idx == -1: return "cpu"
     return f"cuda:{idx}"
-
-
-class ExLlamaV2DeviceTensors:
-
-    model: ExLlamaV2
-    device_idx: int
-    ready: bool
-
-    scratch_bytes: int
-    scratch_idx: int
-
-    sin: torch.Tensor | None
-    cos: torch.Tensor | None
-
-    scratch: torch.Tensor | None
-
-
-    def __init__(self,
-                 model: ExLlamaV2,
-                 device_idx: int,
-                 scratch_bytes: int):
-
-        self.model = model
-        self.device_idx = device_idx
-        self.ready = False
-        self.scratch = None
-        self.scratch_bytes = scratch_bytes
-        self.scratch_idx = 0
-
-
-    def prepare(self, scratch):
-
-        self.prepare_sincos()
-
-        if scratch:
-            self.scratch = torch.empty((self.scratch_bytes // 2,), dtype = torch.half, device = _torch_device(self.device_idx))
-
-        self.ready = True
-
-
-    def drop(self):
-
-        self.scratch = None
-        self.sin = None
-        self.cos = None
-        self.ready = False
-
-
-    def free(self):
-
-        self.drop()
-        self.scratch_bytes = 1
-
-
-    def begin_scratch_alloc(self):
-
-        self.scratch_idx = 0
-
-
-    def get_scratch_slice(self, size_bytes):
-
-        if self.scratch is None: self.prepare(True)
-
-        size_bytes = ((size_bytes + 127) // 128) * 128
-        size_half = size_bytes // 2
-        scratch_slice = self.scratch.narrow(0, self.scratch_idx, size_half)
-        self.scratch_idx += size_half
-        return scratch_slice
-
-
-    def prepare_sincos(self):
-
-        cfg = self.model.config
-
-        base = cfg.rotary_embedding_base
-        alpha = cfg.scale_alpha_value or 1.0
-        scale = cfg.scale_pos_emb or 1.0
-        head_dim = cfg.head_dim
-        device = _torch_device(self.device_idx)
-        scaling_factor = 1.0
-
-        # Alpha scaling for any rope_scaling type
-
-        if alpha != 1.0: base *= alpha ** (cfg.head_dim / (cfg.head_dim - 2))
-
-        # "su"
-
-        if cfg.alt_rope_method == "su":
-
-            a = cfg.max_seq_len
-            b = cfg.original_max_seq_len
-            if a > b:
-                ext_factors = torch.tensor(cfg.scale_long_factor, dtype = torch.float32, device = device)
-                scaling_factor = math.sqrt(1 + math.log(a / b) / math.log(b))
-            else:
-                ext_factors = torch.tensor(cfg.scale_short_factor, dtype = torch.float32, device = device)
-
-            inv_freq = 1.0 / (ext_factors * base ** (torch.arange(0, head_dim, 2, device = device).float() / head_dim))
-
-        # Regular
-
-        else:
-
-            inv_freq = 1.0 / (base ** (torch.arange(0, head_dim, 2, device = device).float() / head_dim))
-
-        # Common
-
-        t = torch.arange(cfg.max_seq_len, device = device, dtype = torch.float32)
-        if scale != 1.0: t /= scale
-
-        freqs = torch.einsum("i,j->ij", t, inv_freq)
-        if cfg.arch.rope_neox_style:
-            emb = torch.cat((freqs, freqs), dim=-1)
-        else:
-            emb = torch.repeat_interleave(freqs, 2, dim=-1)
-
-        self.sin = emb.sin()[None, None, :, :]
-        self.cos = emb.cos()[None, None, :, :]
-        if scaling_factor != 1.0:
-            self.sin *= scaling_factor
-            self.cos *= scaling_factor
-        self.sin = self.sin.half()
-        self.cos = self.cos.half()
 
 
 class ExLlamaV2:
@@ -173,25 +69,32 @@ class ExLlamaV2:
     config: ExLlamaV2Config
     modules: list[ExLlamaV2Module]
     modules_dict: dict[str: ExLlamaV2Module]
-    device_tensors: list[ExLlamaV2DeviceTensors]
+    device_context: list[ExLlamaV2DeviceContext | None]
     cache_map: dict[int: str]
     last_kv_layer_idx: int
     head_layer_idx: int
     loaded: bool
+
+    tp_context: TPContext | None
 
     def __init__(self, config: ExLlamaV2Config, lazy_load = False):
 
         self.config = config
         self.modules = []
         self.modules_dict = {}
-        self.device_tensors = []
+        self.device_context = []
         self.cache_map = {}
         self.loaded = False
+        self.tp_context = None
 
         # Build model
 
         emb = ExLlamaV2Embedding(self, "model.embed_tokens")
         self.modules += [emb]
+
+        if self.config.arch.learned_pos_emb_key:
+            pos_emb = ExLlamaV2PosEmbedding(self, self.config.arch.learned_pos_emb_key)
+            self.modules += [pos_emb]
 
         for layer_idx in range(self.config.num_hidden_layers):
 
@@ -200,7 +103,13 @@ class ExLlamaV2:
                 pd = ExLlamaV2ParallelDecoder(self, layer_key, layer_idx)
                 self.modules += [pd]
             else:
-                attn = ExLlamaV2Attention(self, layer_key, layer_idx)
+                if self.config.arch.alternating_swa:
+                    swa = self.config.sliding_window if not bool(layer_idx % 2) else 0
+                elif self.config.arch.swa:
+                    swa = self.config.sliding_window
+                else:
+                    swa = 0
+                attn = ExLlamaV2Attention(self, layer_key, layer_idx, sliding_window = swa)
                 if self.config.arch.is_moe: mlp = ExLlamaV2MoEMLP(self, layer_key, layer_idx)
                 else: mlp = ExLlamaV2MLP(self, layer_key, layer_idx)
                 self.modules += [attn, mlp]
@@ -216,7 +125,9 @@ class ExLlamaV2:
                                self.config.vocab_size,
                                False,
                                max_out_len = self.config.max_output_len,
-                               prescale = self.config.logit_scale)
+                               prescale = self.config.logit_scale,
+                               is_sub_module = False,
+                               normalize_unq = bool(self.config.norm_head))
         if self.config.arch.lm_head_key != "lm_head":
             head.alt_key = self.config.arch.lm_head_key
         self.modules += [head]
@@ -241,9 +152,11 @@ class ExLlamaV2:
         self.last_kv_layer_idx = layer_idx
 
 
-    def set_device_map(self,
-                       allocation: list[float],
-                       embed_cpu: bool = True) -> list[float]:
+    def set_device_map(
+        self,
+        allocation: list[float],
+        embed_cpu: bool = True
+    ) -> list[float]:
 
         self.cache_map = {}
 
@@ -309,9 +222,12 @@ class ExLlamaV2:
 
         # Prepare to prepare device tensors
 
-        self.device_tensors = []
+        self.device_context = []
         for idx, scratch_bytes in enumerate(fixed_bytes):
-            self.device_tensors.append(ExLlamaV2DeviceTensors(self, idx, scratch_bytes))
+            if scratch_bytes > 0:
+                self.device_context.append(ExLlamaV2DeviceContext(self, idx, scratch_bytes))
+            else:
+                self.device_context.append(None)
 
         # Create map for cache
 
@@ -322,24 +238,67 @@ class ExLlamaV2:
         return [(ab - rb - rba) / 1024**3 for (ab, rb, rba) in zip(allocation_bytes, reserve_bytes, reserve_bytes_attn)]
 
 
-    def load(self,
-             gpu_split: list[float] | None = None,
-             lazy: bool = False,
-             stats: bool = False,
-             callback: Callable[[int, int], None] | None = None,
-             callback_gen: Callable[[int, int], None] | None = None):
+    def load(
+        self,
+        gpu_split: list[float] | None = None,
+        lazy: bool = False,
+        stats: bool = False,
+        callback: Callable[[int, int], None] | None = None,
+        callback_gen: Callable[[int, int], None] | None = None,
+        progress: bool = False
+    ):
+        """
+        Load model, regular manual split mode.
 
+        :param gpu_split:
+            List of VRAM allocations for weights and fixed buffers per GPU. Does not account for the size of the cache
+            which must be allocated with reference to the model subsequently and whose split across GPUs will depend
+            on which devices end up receiving which attention layers.
+
+            If None, only the first GPU is used.
+
+        :param lazy:
+            Only set the device map according to the split, but don't actually load any of the modules. Modules can
+            subsequently be loaded and unloaded one by one for layer-streaming mode.
+
+        :param stats:
+            Legacy, unused
+
+        :param callback:
+            Callable function that triggers after each layer has loaded, for progress update etc.
+
+        :param callback_gen:
+            Same as callback, but for use by async functions
+
+        :param progress:
+            If True, create a rich progress bar in the console while loading. Cannot be used with callbacks
+        """
+
+        if progress:
+            progressbar = get_basic_progress()
+            progressbar.start()
+            task_id = progressbar.add_task("Loading: " + self.config.model_dir, total = len(self.modules))
+            module = 0
+            def callback_pb(a, b):
+                progressbar.update(task_id, advance = 1)
+            assert callback is None, \
+                "Cannot use callback function and console progress bar at the same time."
+            callback = callback_pb
         f = self.load_gen(gpu_split, lazy, stats, callback, callback_gen)
-        for item in f: x = item
+        for item in f:
+            pass
+        if progress:
+            progressbar.stop()
 
 
-    def load_gen(self,
-                 gpu_split: list[float] | None = None,
-                 lazy: bool = False,
-                 stats: bool = False,
-                 callback: Callable[[int, int], None] | None = None,
-                 callback_gen: Callable[[int, int], None] | None = None):
-
+    def load_gen(
+        self,
+        gpu_split: list[float] | None = None,
+        lazy: bool = False,
+        stats: bool = False,
+        callback: Callable[[int, int], None] | None = None,
+        callback_gen: Callable[[int, int], None] | None = None
+    ):
         with torch.inference_mode():
 
             stats_ = self.set_device_map(gpu_split or [99999])
@@ -365,26 +324,186 @@ class ExLlamaV2:
             self.loaded = True
             cleanup_stfiles()
 
-            # if stats: yield gpu_split, stats_
-            # else: yield gpu_split
+
+    def load_tp(
+        self,
+        gpu_split: list[float] | None = None,
+        callback: Callable[[int, int], None] | None = None,
+        callback_gen: Callable[[int, int], None] | None = None,
+        progress: bool = False,
+        expect_cache_tokens: int = 0,
+        expect_cache_base: type = None
+    ):
+        """
+        Load model, tensor-parallel mode.
+
+        :param gpu_split:
+            List of VRAM allocations per GPU. The loader attempts to balance tensor splits to stay within these
+            allocations, accounting for an uneven distribution of attention heads and the expected size of the cache.
+
+            If None, the loader attempts to use all available GPUs and creates a split based on the currently available
+            VRAM according to nvidia-smi etc.
+
+        :param callback:
+            Callable function that triggers after each layer has loaded, for progress update etc.
+
+        :param callback_gen:
+            Same as callback, but for use by async functions
+
+        :param progress:
+            If True, create a rich progress bar in the console while loading. Cannot be used with callbacks
+
+        :param expect_cache_tokens:
+            Expected size of the cache, in tokens (i.e. max_seq_len * max_batch_size, or just the cache size for use
+            with the dynamic generator) to inform the automatic tensor split. If not provided, the configured
+            max_seq_len for the model is assumed.
+
+        :param expect_cache_base:
+            Cache type to expect, e.g. ExLlamaV2Cache_Q6. Also informs the tensor split. If not provided, FP16 cache
+            is assumed.
+        """
+        if progress:
+            progressbar = get_basic_progress()
+            progressbar.start()
+            task_id = progressbar.add_task("Loading: " + self.config.model_dir, total = len(self.modules))
+            module = 0
+            def callback_pb(a, b):
+                progressbar.update(task_id, advance = 1)
+            assert callback is None, \
+                "Cannot use callback function and console progress bar at the same time."
+            callback = callback_pb
+        f = self.load_tp_gen(gpu_split, callback, callback_gen, expect_cache_tokens, expect_cache_base)
+        for item in f:
+            pass
+        if progress:
+            progressbar.stop()
 
 
-    def load_autosplit(self,
-                       cache: ExLlamaV2CacheBase,
-                       reserve_vram: int | None = None,
-                       last_id_only: bool = False,
-                       callback: Callable[[int, int], None] | None = None,
-                       callback_gen: Callable[[int, int], None] | None = None):
+    def load_tp_gen(
+        self,
+        gpu_split: list[float] | None = None,
+        callback: Callable[[int, int], None] | None = None,
+        callback_gen: Callable[[int, int], None] | None = None,
+        expect_cache_tokens: int = 0,
+        expect_cache_base: type = None
+    ):
+        self.config.no_graphs = True
+        self.tp_context = TPContext(self, gpu_split, expect_cache_tokens, expect_cache_base)
 
+        # Create device tensors
+
+        devs = self.tp_context.num_devices
+        scratch = [0] * devs
+        for module in self.modules[1:]:
+            ms = module.scratch_space_tp()
+            for i, m in enumerate(ms):
+                scratch[i] = max(scratch[i], m)
+
+        self.device_context = [None] * devs
+        for idx in range(devs):
+            if scratch[idx] > 0:
+                self.device_context[idx] = ExLlamaV2DeviceContext(self, idx, scratch[idx])
+
+        # Load module weights
+
+        with torch.inference_mode():
+
+            for idx in range(len(self.modules)):
+                module = self.modules[idx]
+
+                if callback is not None: callback(idx, len(self.modules))
+                if callback_gen is not None: yield from callback_gen(idx, len(self.modules))
+
+                if isinstance(module, ExLlamaV2Embedding):
+                    module.set_device_idx(-1)
+                else:
+                    module.set_device_idx(self.tp_context.device)
+
+                module.load(device_context = False)
+
+                if isinstance(module, ExLlamaV2Embedding):
+                    module.tp_split()
+                if isinstance(module, ExLlamaV2Attention):
+                    module.tp_split()
+                if isinstance(module, ExLlamaV2MLP):
+                    module.tp_split()
+                if isinstance(module, ExLlamaV2RMSNorm):
+                    module.tp_split(BROADCAST_VC)
+                elif isinstance(module, ExLlamaV2Linear):
+                    module.tp_split(BROADCAST_VC)
+
+                module.set_device_idx(None)
+
+            torch.cuda.empty_cache()
+            gc.collect()
+
+            if callback is not None: callback(len(self.modules), len(self.modules))
+            if callback_gen is not None: yield from callback_gen(len(self.modules), len(self.modules))
+
+            self.loaded = True
+            cleanup_stfiles()
+
+            self.tp_context.finalize()
+
+
+    def load_autosplit(
+        self,
+        cache: ExLlamaV2CacheBase,
+        reserve_vram: int | list[int] | None = None,
+        last_id_only: bool = False,
+        callback: Callable[[int, int], None] | None = None,
+        callback_gen: Callable[[int, int], None] | None = None,
+        progress: bool = False
+    ):
+        """
+        Load model, auto-split mode. This mode loads the model and builds the cache in parallel, using available
+        devices in turn and moving on to the next device whenever the previous one is full.
+
+        :param cache:
+            Cache constructed with lazy = True. Actual tensor allocation for the cache will happen while loading the
+            model.
+
+        :param reserve_vram:
+            Number of bytes to reserve on each device, either for all devices (as an int) or per-device (as a list).
+
+        :param last_id_only:
+            If True, model will be loaded in a mode that does can only output one set of logits (i.e. one token
+            position) per forward pass. This conserves memory if the model is only to be used for generating text and
+            not e.g. perplexity measurement.
+
+        :param callback:
+            Callable function that triggers after each layer has loaded, for progress update etc.
+
+        :param callback_gen:
+            Same as callback, but for use by async functions
+
+        :param progress:
+            If True, create a rich progress bar in the console while loading. Cannot be used with callbacks
+        """
+        if progress:
+            progressbar = get_basic_progress()
+            progressbar.start()
+            task_id = progressbar.add_task("Loading: " + self.config.model_dir, total = len(self.modules))
+            module = 0
+            def callback_pb(a, b):
+                progressbar.update(task_id, advance = 1)
+            assert callback is None, \
+                "Cannot use callback function and console progress bar at the same time."
+            callback = callback_pb
         f = self.load_autosplit_gen(cache, reserve_vram, last_id_only, callback, callback_gen)
-        for item in f: x = item
+        for item in f:
+            pass
+        if progress:
+            progressbar.stop()
 
-    def load_autosplit_gen(self,
-                           cache: ExLlamaV2CacheBase,
-                           reserve_vram: int | None = None,
-                           last_id_only: bool = False,
-                           callback: Callable[[int, int], None] | None = None,
-                           callback_gen: Callable[[int, int], None] | None = None):
+    def load_autosplit_gen(
+        self,
+        cache: ExLlamaV2CacheBase,
+        reserve_vram: int | list[int] | None = None,
+        last_id_only: bool = False,
+        callback: Callable[[int, int], None] | None = None,
+        callback_gen: Callable[[int, int], None] | None = None
+    ):
 
         # Limit model's max_input_len to max_seq_len if necessary
         self.config.max_input_len = min(self.config.max_input_len, self.config.max_seq_len)
@@ -393,16 +512,18 @@ class ExLlamaV2:
         last_touched_device = -1
         current_device = 0
         num_devices = torch.torch.cuda.device_count()
-        loras = None  # TODO:
+        loras = None  # TODO: Autosplit load with LoRAs
 
         with torch.inference_mode():
 
-            self.device_tensors = []
+            self.device_context = []
 
             # Reserved space
 
             if reserve_vram is None:
                 reserve_vram = [192 * 1024**2] + [64 * 1024**2] * (num_devices - 1)
+            elif isinstance(reserve_vram, int):
+                reserve_vram = [reserve_vram] * num_devices
 
             reserved_vram_tensors = []
             minimum_reserve_tensor = None
@@ -441,7 +562,7 @@ class ExLlamaV2:
 
                     if current_device > last_touched_device:
 
-                        self.device_tensors.append(ExLlamaV2DeviceTensors(self, current_device, scratch_fixed))
+                        self.device_context.append(ExLlamaV2DeviceContext(self, current_device, scratch_fixed))
                         # if attn_mask is not None:
                         #     reserved_vram_tensors.append(attn_mask)
                         #     attn_mask = safe_move_tensor(attn_mask, _torch_device(current_device))
@@ -527,13 +648,20 @@ class ExLlamaV2:
 
 
     def unload(self):
+        """
+        Unloads the model and frees all unmanaged resources.
+        """
 
         for module in self.modules:
             module.unload()
 
         self.modules = []
         self.modules_dict = {}
-        self.device_tensors = []
+        self.device_context = []
+
+        if self.tp_context:
+            self.tp_context.unload()
+            self.tp_context = None
 
 
     def set_cache_map(self):
@@ -549,31 +677,34 @@ class ExLlamaV2:
         return list(set(self.cache_map.values()))
 
 
-    def create_device_tensors(self, scratch_bytes):
+    def create_device_context(self, scratch_bytes):
 
         for idx, b in enumerate(scratch_bytes):
 
-            tensors = ExLlamaV2DeviceTensors(self, idx, b)
-            self.device_tensors.append(tensors)
+            tensors = ExLlamaV2DeviceContext(self, idx, b)
+            self.device_context.append(tensors)
 
 
-    def drop_device_tensors(self):
+    def drop_device_context(self):
 
-        for dt in self.device_tensors:
-            dt.drop()
-
-
-    def free_device_tensors(self):
-
-        for dt in self.device_tensors:
-            dt.free()
+        for dc in self.device_context:
+            dc.drop()
 
 
-    def get_device_tensors(self, device_idx, scratch = True):
+    def free_device_context(self):
 
-        tensors = self.device_tensors[device_idx]
-        if not tensors.ready: tensors.prepare(scratch)
-        return tensors
+        for dc in self.device_context:
+            dc.free()
+
+
+    def get_device_context(self, device_idx, scratch = True):
+
+        if device_idx == -1:
+            return None
+
+        context = self.device_context[device_idx]
+        if not context.ready: context.prepare(scratch)
+        return context
 
 
     def get_modules(self) -> list[ExLlamaV2Module]:
@@ -599,19 +730,21 @@ class ExLlamaV2:
 
 
     @torch.inference_mode()
-    def forward(self,
-                input_ids: torch.Tensor,
-                cache: ExLlamaV2CacheBase | list[ExLlamaV2CacheBase] | None = None,
-                input_mask: torch.Tensor | None = None,
-                preprocess_only: bool = False,
-                last_id_only: bool = False,
-                loras: list[ExLlamaV2Lora] | None = None,
-                return_last_state: bool = False,
-                position_offsets: torch.Tensor | None = None,
-                abort_event: threading.Event | None = None,
-                activation_edit_hooks: list[ExLlamaV2ActivationEditingHook] = [],
-                **kwargs) \
-        -> torch.Tensor | tuple[torch.Tensor, torch.Tensor] | None:
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        cache: ExLlamaV2CacheBase | list[ExLlamaV2CacheBase] | None = None,
+        input_mask: torch.Tensor | None = None,
+        preprocess_only: bool = False,
+        last_id_only: bool = False,
+        loras: list[ExLlamaV2Lora] | None = None,
+        return_last_state: bool = False,
+        position_offsets: torch.Tensor | None = None,
+        abort_event: threading.Event | None = None,
+        cpu_logits: bool = False,
+        activation_edit_hooks: list[ExLlamaV2ActivationEditingHook] = [],
+        **kwargs
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor] | None:
         """
         Runs a forward pass through the model. If a cache is used, also appends keys/values to the cache
         and advances it.
@@ -646,6 +779,11 @@ class ExLlamaV2:
         :param abort_event:
             Optional event that, if set, will abort the forward pass. Function will return None if aborted.
 
+        :param cpu_logits:
+            If True, logits are collected and returned in system RAM. This is somewhat slower but can prevent
+            out-of-memory errors when computing logits for all positions in a long sequence, such as during a
+            perplexity test.
+
         :param activation_edit_hooks:
             List of ExLlamaV2ActivationEditingHook objects to apply during generation.
 
@@ -673,24 +811,24 @@ class ExLlamaV2:
 
             assert q_len <= effective_max_input_len, "Maximum input length exceeded in model.forward"
 
-            result, last_state = self._forward(input_ids = input_ids,
-                                               cache = cache,
-                                               input_mask = input_mask,
-                                               preprocess_only = preprocess_only,
-                                               last_id_only = last_id_only,
-                                               loras = loras,
-                                               return_last_state = return_last_state,
-                                               position_offsets = position_offsets,
-                                               abort_event = abort_event,
-                                               activation_edit_hooks = activation_edit_hooks,
-                                               **kwargs)
+            result = self.forward_chunk(input_ids = input_ids,
+                                        cache = cache,
+                                        input_mask = input_mask,
+                                        preprocess_only = preprocess_only,
+                                        last_id_only = last_id_only,
+                                        loras = loras,
+                                        return_last_state = return_last_state,
+                                        position_offsets = position_offsets,
+                                        abort_event = abort_event,
+                                        activation_edit_hooks = activation_edit_hooks,
+                                        **kwargs)
 
             if abort_event and abort_event.is_set(): return
 
-            if last_state is None:
-                return result
+            if "last_state" in result:
+                return result.get("logits"), result["last_state"]
             else:
-                return result, last_state
+                return result.get("logits")
 
         # Confirm that the input fits within the allocated cache space
 
@@ -711,7 +849,8 @@ class ExLlamaV2:
 
             # Limit chunk_size to keep size of attention operation <= max_attention_size
 
-            if has_flash_attn:
+            if (has_flash_attn and not self.config.no_flash_attn) \
+                or (has_xformers and not self.config.no_xformers):
 
                 # Can't measure increase in VRAM usage with longer k_len, assume usage is constant
                 # for given chunk_size
@@ -735,27 +874,30 @@ class ExLlamaV2:
             _last_id_only = last_id_only
             _preprocess_only = preprocess_only or (chunk_end < q_len and last_id_only)
 
-            r, ls = self._forward(input_ids = input_ids[:, chunk_begin : chunk_end],
-                                  cache = cache,
-                                  input_mask = input_mask,
-                                  preprocess_only = _preprocess_only,
-                                  last_id_only = _last_id_only,
-                                  loras = loras,
-                                  return_last_state = return_last_state and remaining_q_len <= chunk_size,
-                                  position_offsets = position_offsets,
-                                  abort_event = abort_event,
-                                  activation_edit_hooks = activation_edit_hooks,
-                                  **kwargs)
+            r = self.forward_chunk(
+                input_ids = input_ids[:, chunk_begin : chunk_end],
+                cache = cache,
+                input_mask = input_mask,
+                preprocess_only = _preprocess_only,
+                last_id_only = _last_id_only,
+                loras = loras,
+                return_last_state = return_last_state and remaining_q_len <= chunk_size,
+                position_offsets = position_offsets,
+                abort_event = abort_event,
+                activation_edit_hooks = activation_edit_hooks,
+                **kwargs
+            )
 
             if abort_event and abort_event.is_set(): return
 
             if not _preprocess_only:
-                result = r if result is None else torch.cat((result, r), dim = 1)
-                r = None
+                if cpu_logits:
+                    r["logits"] = r["logits"].cpu()
+                result = r["logits"] if result is None else torch.cat((result, r["logits"]), dim = 1)
 
             chunk_begin = chunk_end
             remaining_q_len -= chunk_size
-            last_state = ls
+            last_state = r.get("last_state")
 
         if last_state is None:
             return result
@@ -764,27 +906,28 @@ class ExLlamaV2:
 
 
     @torch.inference_mode()
-    def _forward(self,
-                 input_ids: torch.Tensor,
-                 cache: ExLlamaV2CacheBase | list[ExLlamaV2CacheBase] | None = None,
-                 input_mask: torch.Tensor | None = None,
-                 preprocess_only: bool = False,
-                 last_id_only: bool = False,
-                 loras: list[ExLlamaV2Lora] | None = None,
-                 return_last_state: bool = False,
-                 position_offsets: torch.Tensor | None = None,
-                 abort_event: threading.Event | None = None,
-                 activation_edit_hooks: list[ExLlamaV2ActivationEditingHook] = [],
-                 **kwargs) \
-        -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    # @profile
+    def forward_chunk(
+        self,
+        input_ids: torch.Tensor,
+        cache: ExLlamaV2CacheBase | None = None,
+        input_mask: torch.Tensor | None = None,
+        preprocess_only: bool = False,
+        last_id_only: bool = False,
+        loras: list[ExLlamaV2Lora] | None = None,
+        return_last_state: bool = False,
+        position_offsets: torch.Tensor | None = None,
+        abort_event: threading.Event | None = None,
+        attn_params: ExLlamaV2Attention.Params | None = None,
+        extract_state_indices: list[int] | None = None,
+        activation_edit_hooks: list[ExLlamaV2ActivationEditingHook] = [],
+        **kwargs
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
 
         batch_size, seq_len = input_ids.shape
         past_len = 0
         if cache is not None:
-            if isinstance(cache, ExLlamaV2CacheBase):
-                past_len = cache.current_seq_len
-            else:
-                past_len = [c.current_seq_len for c in cache]
+            past_len = cache.current_seq_len
 
         assert self.config.max_output_len is None or \
             preprocess_only or \
@@ -792,33 +935,53 @@ class ExLlamaV2:
             seq_len <= self.config.max_output_len, \
             "seq_len exceeds max_output_len"
 
+        # Ensure streams are always set in the current thread
+
+        set_device_streams()
+
+        # Output
+
+        r = {}
+        extract_state_indices = set(extract_state_indices or [])
+        if return_last_state:
+            extract_state_indices.add(self.head_layer_idx - 1)
+        if extract_state_indices:
+            r["states"] = {}
+
         # assert cache is None or isinstance(cache, list) or batch_size <= cache.batch_size
 
         x = input_ids
-        attn_params = ExLlamaV2Attention.Params(batch_size, seq_len, past_len, input_mask, position_offsets)
-        last_state = None
-        last_module = None
+
+        if not attn_params:
+            attn_params = ExLlamaV2Attention.Params(batch_size, seq_len, past_len, input_mask, position_offsets)
+        else:
+            if not isinstance(attn_params, ExLlamaV2Attention.PagedParams):
+                past_len = attn_params.past_len
+                cache.current_seq_len = past_len
+
+        device = self.modules[0].device_idx
 
         for idx, module in enumerate(self.modules):
 
+            if idx == self.head_layer_idx and last_id_only:
+                x = x.narrow(-2, -1, 1)
+
+            if idx in extract_state_indices:
+                r["states"][idx] = x.clone()
+                if idx == self.head_layer_idx - 1:
+                    r["last_state"] = r["states"][idx]
+
             # Respect abort signal
 
-            if abort_event and abort_event.is_set(): return None, None
+            if abort_event and abort_event.is_set():
+                return None, None
 
             # Onward
 
-            device = _torch_device(module.device_idx)
+            n_device = module.device_idx
+            if n_device is not None and n_device != device and n_device >= 0:
+                x = safe_move_tensor(x, n_device, non_blocking = True)
 
-            if idx == self.head_layer_idx:
-                if last_id_only and return_last_state:
-                    x = x.narrow(-2, -1, 1)
-                    last_state = x
-                elif last_id_only:
-                    x = x.narrow(-2, -1, 1)
-                elif return_last_state:
-                    last_state = x.narrow(-2, -1, 1)
-
-            x = safe_move_tensor(x, device)
             x = module.forward(x, cache = cache, attn_params = attn_params, past_len = past_len, loras = loras, **kwargs)
             for hook in activation_edit_hooks:
                 hook_result = hook(x, idx, module)
@@ -832,15 +995,24 @@ class ExLlamaV2:
         # Advance cache
 
         if cache is not None:
-            if isinstance(cache, list):
-                for c in cache: c.current_seq_len += seq_len
-            else:
-                cache.current_seq_len += seq_len
+            cache.current_seq_len += seq_len
+
+        # Final sync if gathering logits
+
+        if self.tp_context:
+            self.tp_context.wait_streams()
+
+        if x is not None and x.is_cuda:
+            context = self.get_device_context(x.device.index)
+            torch.cuda.set_stream(context.stream)
 
         # Apply logit scale
 
         # if x is not None and self.config.logit_scale != 1:
         #     x.mul_(self.config.logit_scale)
+
+        if x is not None and self.config.final_logit_softcapping:
+            ext_c.softcap_(x, self.config.final_logit_softcapping)
 
         # Set padding logits to -inf
 
@@ -848,5 +1020,6 @@ class ExLlamaV2:
             head_padding = self.modules[-1].padding
             if head_padding > 0:
                 x[:, :, -head_padding:] = -65504.
+            r["logits"] = x
 
-        return x, last_state
+        return r

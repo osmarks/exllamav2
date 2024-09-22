@@ -43,6 +43,9 @@ setup_kwargs = {
                 "exllamav2/exllamav2_ext/ext_rope.cpp",
                 "exllamav2/exllamav2_ext/ext_safetensors.cpp",
                 "exllamav2/exllamav2_ext/ext_sampling.cpp",
+                "exllamav2/exllamav2_ext/ext_element.cpp",
+                "exllamav2/exllamav2_ext/ext_tp.cpp",
+                "exllamav2/exllamav2_ext/cuda/graph.cu",
                 "exllamav2/exllamav2_ext/cuda/h_add.cu",
                 "exllamav2/exllamav2_ext/cuda/h_gemm.cu",
                 "exllamav2/exllamav2_ext/cuda/lora.cu",
@@ -58,6 +61,8 @@ setup_kwargs = {
                 "exllamav2/exllamav2_ext/cuda/rope.cu",
                 "exllamav2/exllamav2_ext/cuda/cache.cu",
                 "exllamav2/exllamav2_ext/cuda/util.cu",
+                "exllamav2/exllamav2_ext/cuda/softcap.cu",
+                "exllamav2/exllamav2_ext/cuda/tp.cu",
                 "exllamav2/exllamav2_ext/cuda/comp_units/kernel_select.cu",
                 "exllamav2/exllamav2_ext/cuda/comp_units/unit_gptq_1.cu",
                 "exllamav2/exllamav2_ext/cuda/comp_units/unit_gptq_2.cu",
@@ -70,6 +75,7 @@ setup_kwargs = {
                 "exllamav2/exllamav2_ext/cuda/comp_units/unit_exl2_3b.cu",
                 "exllamav2/exllamav2_ext/cpp/quantize_func.cpp",
                 "exllamav2/exllamav2_ext/cpp/profiling.cpp",
+                "exllamav2/exllamav2_ext/cpp/generator.cpp",
                 "exllamav2/exllamav2_ext/cpp/sampling.cpp",
                 "exllamav2/exllamav2_ext/cpp/sampling_avx2.cpp",
                 "exllamav2/exllamav2_ext/cpp/safetensors.cpp"
@@ -114,7 +120,8 @@ setup(
         "pygments",
         "websockets",
         "regex",
-        "numpy"
+        "numpy",
+        "rich"
     ],
     include_package_data = True,
     verbose = verbose,
