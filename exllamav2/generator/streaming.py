@@ -21,6 +21,7 @@ import threading
 from exllamav2.generator.hooks import ExLlamaV2PostSamplingHook, ExLlamaV2PostSamplingResult
 from exllamav2.embedding import EMBEDDING_INDEX
 from exllamav2.ext import exllamav2_ext as ext_c, none_tensor
+from exllamav2.activation_editing import ExLlamaV2ActivationEditingHook
 import numpy as np
 
 class ExLlamaV2StreamingGenerator(ExLlamaV2BaseGenerator):
@@ -120,6 +121,8 @@ class ExLlamaV2StreamingGenerator(ExLlamaV2BaseGenerator):
     filters: list[ExLlamaV2Filter] | None
     filter_prefer_eos: bool
 
+    activation_edit_hooks: list[ExLlamaV2ActivationEditingHook]
+
 
     def __init__(self, model, cache, tokenizer, draft_model = None, draft_cache = None, num_speculative_tokens = 5):
         super().__init__(model, cache, tokenizer)
@@ -190,6 +193,8 @@ class ExLlamaV2StreamingGenerator(ExLlamaV2BaseGenerator):
         self.current_blocked_tokens = []
         self.reuse_logits = None
 
+        self.activation_edit_hooks = []
+
 
     def set_stop_conditions(self,
                             stop_conditions: list | tuple | set):
@@ -255,6 +260,7 @@ class ExLlamaV2StreamingGenerator(ExLlamaV2BaseGenerator):
         banned_strings: list[str] | None = None,
         filters: list[ExLlamaV2Filter] | None = None,
         filter_prefer_eos: bool = False,
+        activation_edit_hooks: list[ExLlamaV2ActivationEditingHook] = [],
         **kwargs
     ):
         """
@@ -393,6 +399,8 @@ class ExLlamaV2StreamingGenerator(ExLlamaV2BaseGenerator):
 
         self.filters = filters if filters is not None else []
         self.filter_prefer_eos = filter_prefer_eos
+
+        self.activation_edit_hooks = activation_edit_hooks
 
 
     # Convert list of strings to UTF32 format needed, to pass by reference to partial matching function
@@ -696,7 +704,8 @@ class ExLlamaV2StreamingGenerator(ExLlamaV2BaseGenerator):
                            input_mask = self.input_mask,
                            position_offsets = self.position_offsets,
                            abort_event = self.abort_event,
-                           indexed_embeddings = self.indexed_embeddings)
+                           indexed_embeddings = self.indexed_embeddings,
+                           activation_edit_hooks = self.activation_edit_hooks)
         if self.abort_event and self.abort_event.is_set():
             self._truncate_seq_to_cache()
             return
@@ -771,7 +780,8 @@ class ExLlamaV2StreamingGenerator(ExLlamaV2BaseGenerator):
                            input_mask = self.input_mask,
                            position_offsets = self.position_offsets,
                            abort_event = self.abort_event,
-                           indexed_embeddings = self.indexed_embeddings)
+                           indexed_embeddings = self.indexed_embeddings,
+                           activation_edit_hooks = self.activation_edit_hooks)
         if self.abort_event and self.abort_event.is_set():
             self._truncate_seq_to_cache()
             return
@@ -812,7 +822,8 @@ class ExLlamaV2StreamingGenerator(ExLlamaV2BaseGenerator):
                     self.cache,
                     loras = self.active_loras,
                     input_mask = self.input_mask,
-                    position_offsets = self.position_offsets
+                    position_offsets = self.position_offsets,
+                    activation_edit_hooks = self.activation_edit_hooks
                 )
                 logits = dev_logits.float().cpu()
 
@@ -906,7 +917,8 @@ class ExLlamaV2StreamingGenerator(ExLlamaV2BaseGenerator):
                                                     self.cache,
                                                     loras = self.active_loras,
                                                     input_mask = self.input_mask,
-                                                    position_offsets = self.position_offsets).float().cpu()
+                                                    position_offsets = self.position_offsets,
+                                                    activation_edit_hooks = self.activation_edit_hooks).float().cpu()
 
             # Rewind model cache
 
@@ -968,7 +980,8 @@ class ExLlamaV2StreamingGenerator(ExLlamaV2BaseGenerator):
                                                     self.cache,
                                                     loras = self.active_loras,
                                                     input_mask = self.input_mask,
-                                                    position_offsets = self.position_offsets)
+                                                    position_offsets = self.position_offsets,
+                                                    activation_edit_hooks = self.activation_edit_hooks)
             self.future_logits = self.future_logits.float().cpu()
 
             self.cache.current_seq_len -= len(inf_ids)
