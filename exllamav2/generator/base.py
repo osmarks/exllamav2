@@ -14,6 +14,7 @@ import random
 import threading
 from exllamav2.generator.hooks import ExLlamaV2PostSamplingHook, ExLlamaV2PostSamplingResult
 from exllamav2.embedding import EMBEDDING_INDEX
+from exllamav2.activation_editing import ExLlamaV2ActivationEditingHook
 
 class ExLlamaV2BaseGenerator:
 
@@ -66,7 +67,8 @@ class ExLlamaV2BaseGenerator:
                         add_bos: bool = False,
                         abort_event: threading.Event | None = None,
                         input_embeddings: torch.Tensor | None = None,
-                        completion_only: bool = False):
+                        completion_only: bool = False,
+                        activation_edit_hooks: list[ExLlamaV2ActivationEditingHook] = []):
 
         """
         Generate one or more completions.
@@ -117,6 +119,9 @@ class ExLlamaV2BaseGenerator:
 
         :param completion_only:
             Only return completion. If False, returned string will include the input prompt.
+
+        :param activation_edit_hooks:
+            List of ExLlamaV2ActivationEditingHook objects to apply during generation.
 
         :return:
             Completion(s) (str or list[str] depending on the type of the input prompt argument)
@@ -209,7 +214,8 @@ class ExLlamaV2BaseGenerator:
                              mask,
                              loras,
                              position_offsets = position_offsets,
-                             input_embeddings = input_embeddings)
+                             input_embeddings = input_embeddings,
+                             activation_edit_hooks = activation_edit_hooks)
 
         if self.abort_event and self.abort_event.is_set():
             if isinstance(prompt, str): return ""
@@ -245,7 +251,8 @@ class ExLlamaV2BaseGenerator:
                                         input_mask = mask,
                                         loras = loras,
                                         position_offsets = position_offsets,
-                                        indexed_embeddings = input_embeddings).float().cpu()
+                                        indexed_embeddings = input_embeddings,
+                                        activation_edit_hooks = activation_edit_hooks).float().cpu()
 
             token, ptokens, pprobs, prob, eos = ExLlamaV2Sampler.sample(logits,
                                                                         gen_settings,
@@ -316,7 +323,8 @@ class ExLlamaV2BaseGenerator:
                         mask: torch.Tensor | None = None,
                         loras: ExLlamaV2Lora or list[ExLlamaV2Lora] or None = None,
                         position_offsets: torch.Tensor | None = None,
-                        input_embeddings: torch.Tensor | None = None):
+                        input_embeddings: torch.Tensor | None = None,
+                        activation_edit_hooks: list[ExLlamaV2ActivationEditingHook] = []):
 
         self.cache.current_seq_len = 0
         self.sequence_ids = input_ids
@@ -328,6 +336,7 @@ class ExLlamaV2BaseGenerator:
                            loras = loras,
                            position_offsets = position_offsets,
                            abort_event = self.abort_event,
-                           indexed_embeddings = input_embeddings)
+                           indexed_embeddings = input_embeddings,
+                           activation_edit_hooks = activation_edit_hooks)
         if self.abort_event and self.abort_event.is_set():
             self.sequence_ids = self.sequence_ids[:, :self.cache.current_seq_len + 1]

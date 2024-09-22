@@ -34,6 +34,7 @@ from exllamav2.parallel_decoder import ExLlamaV2ParallelDecoder
 from exllamav2.embedding import ExLlamaV2Embedding
 from exllamav2.compat import safe_move_tensor
 from exllamav2.fasttensors import cleanup_stfiles
+from exllamav2.activation_editing import ExLlamaV2ActivationEditingHook
 # from exllamav2.util import list_live_tensors, print_vram_usage, set_snapshot, diff_snapshot, print_vram_usage_peak
 import gc
 import threading
@@ -608,6 +609,7 @@ class ExLlamaV2:
                 return_last_state: bool = False,
                 position_offsets: torch.Tensor | None = None,
                 abort_event: threading.Event | None = None,
+                activation_edit_hooks: list[ExLlamaV2ActivationEditingHook] = [],
                 **kwargs) \
         -> torch.Tensor | tuple[torch.Tensor, torch.Tensor] | None:
         """
@@ -644,6 +646,9 @@ class ExLlamaV2:
         :param abort_event:
             Optional event that, if set, will abort the forward pass. Function will return None if aborted.
 
+        :param activation_edit_hooks:
+            List of ExLlamaV2ActivationEditingHook objects to apply during generation.
+
         :return:
             FP16 logits tensor, shape (batch_size, q_len, vocab_size)
             (optional) state tensor, shape (batch_size, q_len, hidden_size)
@@ -677,6 +682,7 @@ class ExLlamaV2:
                                                return_last_state = return_last_state,
                                                position_offsets = position_offsets,
                                                abort_event = abort_event,
+                                               activation_edit_hooks = activation_edit_hooks,
                                                **kwargs)
 
             if abort_event and abort_event.is_set(): return
@@ -738,6 +744,7 @@ class ExLlamaV2:
                                   return_last_state = return_last_state and remaining_q_len <= chunk_size,
                                   position_offsets = position_offsets,
                                   abort_event = abort_event,
+                                  activation_edit_hooks = activation_edit_hooks,
                                   **kwargs)
 
             if abort_event and abort_event.is_set(): return
@@ -767,6 +774,7 @@ class ExLlamaV2:
                  return_last_state: bool = False,
                  position_offsets: torch.Tensor | None = None,
                  abort_event: threading.Event | None = None,
+                 activation_edit_hooks: list[ExLlamaV2ActivationEditingHook] = [],
                  **kwargs) \
         -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
 
@@ -812,6 +820,10 @@ class ExLlamaV2:
 
             x = safe_move_tensor(x, device)
             x = module.forward(x, cache = cache, attn_params = attn_params, past_len = past_len, loras = loras, **kwargs)
+            for hook in activation_edit_hooks:
+                hook_result = hook(x, idx, module)
+                if hook_result is not None:
+                    x = hook_result
 
             if preprocess_only and idx == self.last_kv_layer_idx:
                 x = None
